@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# FUSE
+/mnt/
+/.fuse_github_state/
+
+# Secrets
+.env
+.env.*
+*.token
+my/
+
+# Backups
+*.bak
+*_v1_backup.py
+*_backup.py
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary files
+*.log
+*~
