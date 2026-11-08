@@ -192,6 +192,20 @@ class GitHubAPI:
             raise GitHubAPIError("Blob exceeds 2 MiB lab limit", 413)
         return content
 
+    def merge_branch(self, repo: str, base: str, head: str,
+                     message: str | None = None):
+        """Merge published `head` into `base`; 204 returns None."""
+        payload = {"base": base, "head": head}
+        if message:
+            payload["commit_message"] = message
+        return self._post(self._repo(repo) + "/merges", payload)
+
+    def delete_branch(self, repo: str, branch: str):
+        """Delete refs/heads/<branch> (GitHub forbids default branch deletion)."""
+        self.require_token()
+        return self._request("DELETE", self._repo(repo) +
+                             "/git/refs/heads/" + self._q(branch, slash=True))
+
     def create_branch(self, repo: str, branch: str, sha: str):
         return self._post(self._repo(repo) + "/git/refs", {
             "ref": "refs/heads/" + branch, "sha": sha,

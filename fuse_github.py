@@ -104,17 +104,23 @@ class GitHubFS(pyfuse3.Operations):
         self.head_cache: dict[tuple[str, str], tuple[str, float]] = {}
         self.repo_details: dict[str, dict] = {}
         self.branch_list_time: dict[str, float] = {}
+        # A remote merge changes the HEAD and invalidates the mounted workspace
+        # snapshot. Block further writes to that target until a remount.
+        self.remount_required: set[tuple[str, str]] = set()
 
         root = Node(pyfuse3.ROOT_INODE, pyfuse3.ROOT_INODE, b"", "root", True)
         self.nodes[root.inode] = root
         self.children[root.inode] = {}
         help_text = (
-            f"FUSE GitHub v2 for @{client.username}\n"
-            "Tree: <repo>/branches/<encoded-branch>/{HEAD.txt,commits,workspace,_commit}.\n"
+            f"FUSE GitHub filesystem for @{client.username}\n"
+            "Tree: <repo>/branches/<encoded-branch>/{HEAD.txt,commits,workspace,_commit,_merge}.\n"
             "Branch with /: feature/login becomes feature%2Flogin.\n"
             "mkdir branches/<new-name> creates a branch at default HEAD.\n"
             "Edit workspace/ locally; mkdir _commit/<unique-message> publishes one commit.\n"
-            "No automatic merge/rebase, no force push, no history edits.\n"
+            "mkdir <target-branch>/_merge/<encoded-source> merges published source into target.\n"
+            "rmdir branches/<encoded-branch> deletes a non-default branch with no draft.\n"
+            "Remount after a successful merge before editing target workspace again.\n"
+            "No automatic conflict resolution/rebase, no force push, no history edits.\n"
             "Each commit's changed/ includes the new versions of changed files only.\n"
             "More history: commits/pages/2, commits/pages/3, ... (30 per page).\n"
             "GITHUB_TOKEN with Contents:write is needed for all write operations.\n"
@@ -194,11 +200,13 @@ class GitHubFS(pyfuse3.Operations):
         attr.st_ino = node.inode
         attr.generation = 0
         mutable = node.kind.startswith("ws_") or node.kind in (
-            "workspace", "branch", "branches", "commits", "commit_trigger", "head_file")
+            "workspace", "branch", "branches", "commits", "commit_trigger",
+            "merge_trigger", "head_file")
         attr.entry_timeout = 0.5 if mutable else 30.0
         attr.attr_timeout = 0.5 if mutable else 30.0
         if node.is_dir:
-            writable = node.kind in ("branches", "workspace", "ws_dir", "commit_trigger")
+            writable = node.kind in (
+                "branches", "workspace", "ws_dir", "commit_trigger", "merge_trigger")
             attr.st_mode = stat.S_IFDIR | (0o755 if writable else 0o555)
             attr.st_nlink = 2 + sum(
                 self.nodes[child].is_dir for child in self.children[node.inode].values())
@@ -275,6 +283,8 @@ class GitHubFS(pyfuse3.Operations):
         self._add(node.inode, "commits", "commits", True, repo=node.repo, branch=node.branch)
         self._add(node.inode, "workspace", "workspace", True, repo=node.repo, branch=node.branch)
         self._add(node.inode, "_commit", "commit_trigger", True,
+                  repo=node.repo, branch=node.branch)
+        self._add(node.inode, "_merge", "merge_trigger", True,
                   repo=node.repo, branch=node.branch)
         node.loaded = True
 
@@ -567,7 +577,7 @@ class GitHubFS(pyfuse3.Operations):
             if not self.client.token:
                 return False
             if node.kind not in ("branches", "workspace", "ws_dir",
-                                 "ws_file", "commit_trigger"):
+                                 "ws_file", "commit_trigger", "merge_trigger"):
                 return False
         return True
 
@@ -614,6 +624,12 @@ class GitHubFS(pyfuse3.Operations):
         if not self.client.token:
             raise pyfuse3.FUSEError(errno.EACCES)
 
+    def _require_current_workspace(self, node: Node):
+        if (node.repo, node.branch) in self.remount_required:
+            print("Branch HEAD changed after merge: remount FUSE before editing "
+                  "or committing in this branch.", file=sys.stderr, flush=True)
+            raise pyfuse3.FUSEError(errno.ESTALE)
+
     async def open(self, inode, flags, ctx=None):
         node = self._node(inode)
         if node.is_dir:
@@ -625,6 +641,7 @@ class GitHubFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EROFS)
         if access != os.O_RDONLY:
             self._allow_write()
+            self._require_current_workspace(node)
         if flags & os.O_TRUNC:
             if node.kind != "ws_file":
                 raise pyfuse3.FUSEError(errno.EROFS)
@@ -678,6 +695,7 @@ class GitHubFS(pyfuse3.Operations):
         if node.kind != "ws_file" or flags & os.O_ACCMODE == os.O_RDONLY:
             raise pyfuse3.FUSEError(errno.EROFS)
         self._allow_write()
+        self._require_current_workspace(node)
         branch_ctx = await self._branch_context(node)
         async with branch_ctx.lock:
             previous = await self._data(node)
@@ -696,6 +714,7 @@ class GitHubFS(pyfuse3.Operations):
         self._allow_write()
         if parent.kind not in ("workspace", "ws_dir"):
             raise pyfuse3.FUSEError(errno.EROFS)
+        self._require_current_workspace(parent)
         filename = self._name(name)
         await self._ensure(parent)
         if name in self.children[parent_inode]:
@@ -720,6 +739,8 @@ class GitHubFS(pyfuse3.Operations):
                 raise pyfuse3.FUSEError(errno.EROFS)
             return self._attrs(node)
         self._allow_write()
+        if fields.update_size or fields.update_mode:
+            self._require_current_workspace(node)
         if fields.update_size:
             size = attr.st_size
             if size < 0 or size > self.client.MAX_BLOB:
@@ -741,6 +762,7 @@ class GitHubFS(pyfuse3.Operations):
         self._allow_write()
         if parent.kind not in ("workspace", "ws_dir"):
             raise pyfuse3.FUSEError(errno.EROFS)
+        self._require_current_workspace(parent)
         await self._ensure(parent)
         inode = self.children[parent_inode].get(name)
         if inode is None:
@@ -763,8 +785,10 @@ class GitHubFS(pyfuse3.Operations):
     async def rmdir(self, parent_inode, name, ctx=None):
         parent = self._node(parent_inode)
         self._allow_write()
-        if parent.kind not in ("workspace", "ws_dir"):
+        if parent.kind not in ("branches", "workspace", "ws_dir"):
             raise pyfuse3.FUSEError(errno.EROFS)
+        if parent.kind != "branches":
+            self._require_current_workspace(parent)
         await self._ensure(parent)
         inode = self.children[parent_inode].get(name)
         if inode is None:
@@ -772,13 +796,85 @@ class GitHubFS(pyfuse3.Operations):
         node = self._node(inode)
         if not node.is_dir:
             raise pyfuse3.FUSEError(errno.ENOTDIR)
-        if self.children[inode]:
-            raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+        if parent.kind == "branches":
+            # This removes a GitHub ref, not a real local non-empty directory.
+            if node.kind != "branch":
+                raise pyfuse3.FUSEError(errno.EROFS)
+            default = self.repo_details[parent.repo].get("default_branch")
+            if node.branch == default:
+                raise pyfuse3.FUSEError(errno.EPERM)
+            self._require_current_workspace(node)
+            branch_ctx = await self._branch_context(node)
+            async with branch_ctx.lock:
+                if branch_ctx.draft.edits or branch_ctx.draft.dirs:
+                    print("Branch deletion refused: unpublished draft exists. "
+                          "Publish it or back it up and resolve it manually.",
+                          file=sys.stderr, flush=True)
+                    raise pyfuse3.FUSEError(errno.EBUSY)
+                head = await self._head(node.repo, node.branch, fresh=True)
+                if head != branch_ctx.draft.base_sha:
+                    raise pyfuse3.FUSEError(errno.ESTALE)
+                await self._api(self.client.delete_branch, node.repo, node.branch)
+                self._remove(parent_inode, name)
+                self.branch_contexts.pop((node.repo, node.branch), None)
+                self.head_cache.pop((node.repo, node.branch), None)
+                # Local state is intentionally not erased; it may hold receipts.
+        else:
+            if self.children[inode]:
+                raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+            branch_ctx = await self._branch_context(parent)
+            async with branch_ctx.lock:
+                branch_ctx.draft.dirs.discard(node.path)
+                self._save(parent, branch_ctx)
+                self._remove(parent_inode, name)
+
+    async def _merge(self, parent: Node, source: str) -> str:
+        """Merge published `source` into `parent.branch` using the GitHub API.
+
+        Called while the target branch's Trio lock is held. No local workspace
+        edits are merged: all local edits must be committed before this call.
+        """
         branch_ctx = await self._branch_context(parent)
-        async with branch_ctx.lock:
-            branch_ctx.draft.dirs.discard(node.path)
-            self._save(parent, branch_ctx)
-            self._remove(parent_inode, name)
+        if branch_ctx.draft.edits or branch_ctx.draft.dirs:
+            print("Merge refused: target branch has unpublished draft changes.",
+                  file=sys.stderr, flush=True)
+            raise pyfuse3.FUSEError(errno.EBUSY)
+        old_head = await self._head(parent.repo, parent.branch, fresh=True)
+        if old_head != branch_ctx.draft.base_sha:
+            print("Merge refused: target HEAD changed since local state was loaded.",
+                  file=sys.stderr, flush=True)
+            raise pyfuse3.FUSEError(errno.ESTALE)
+        # Confirm the source is a real remote branch, not a local-only name.
+        await self._head(parent.repo, source, fresh=True)
+        result = await self._api(self.client.merge_branch, parent.repo,
+                                 parent.branch, source,
+                                 f"Merge {source} into {parent.branch}")
+        # GitHub returns a commit (201) or None (204, already merged).
+        sha = await self._head(parent.repo, parent.branch, fresh=True)
+        if result is not None:
+            if not isinstance(result, dict) or not result.get("sha"):
+                raise pyfuse3.FUSEError(errno.EIO)
+            if result["sha"] != sha:
+                print("WARNING: target HEAD moved again immediately after merge; "
+                      "remount before continuing.", file=sys.stderr, flush=True)
+        if sha != old_head:
+            branch_ctx.draft.base_sha = sha
+            try:
+                self.store.save(self.client.username, parent.repo,
+                                parent.branch, branch_ctx.draft)
+            except OSError as exc:
+                # Remote merge succeeded; do not report it as an unpublished merge.
+                print(f"WARNING: remote merge was successful, but local state "
+                      f"could not be saved: {exc}", file=sys.stderr, flush=True)
+            self.remount_required.add((parent.repo, parent.branch))
+            head_inode = self.children[parent.parent].get(b"HEAD.txt")
+            if head_inode is not None:
+                self.nodes[head_inode].data = (sha + "\n").encode()
+                self.nodes[head_inode].size = len(sha) + 1
+            print(f"Merge complete: {source} -> {parent.branch}, HEAD={sha}. "
+                  "Remount before editing target workspace again.",
+                  file=sys.stderr, flush=True)
+        return sha
 
     async def _publish(self, parent: Node, label: str) -> str:
         # This function executes under the per-branch Trio lock.
@@ -852,6 +948,8 @@ class GitHubFS(pyfuse3.Operations):
         parent = self._node(parent_inode)
         self._allow_write()
         component = self._name(name)
+        if parent.kind in ("workspace", "ws_dir", "commit_trigger", "merge_trigger"):
+            self._require_current_workspace(parent)
         await self._ensure(parent)
         if name in self.children[parent_inode]:
             raise pyfuse3.FUSEError(errno.EEXIST)
@@ -871,6 +969,7 @@ class GitHubFS(pyfuse3.Operations):
             inode = self._add(parent_inode, component, "branch", True,
                               repo=parent.repo, branch=branch)
         elif parent.kind in ("workspace", "ws_dir"):
+            self._require_current_workspace(parent)
             path = "/".join(part for part in (parent.path, component) if part)
             branch_ctx = await self._branch_context(parent)
             async with branch_ctx.lock:
@@ -879,6 +978,7 @@ class GitHubFS(pyfuse3.Operations):
                 inode = self._add(parent_inode, component, "ws_dir", True,
                                   repo=parent.repo, branch=parent.branch, path=path)
         elif parent.kind == "commit_trigger":
+            self._require_current_workspace(parent)
             if not 1 <= len(component) <= 80 or component.startswith("."):
                 raise pyfuse3.FUSEError(errno.EINVAL)
             branch_ctx = await self._branch_context(parent)
@@ -887,6 +987,19 @@ class GitHubFS(pyfuse3.Operations):
                     raise pyfuse3.FUSEError(errno.EEXIST)
                 sha = await self._publish(parent, component)
                 inode = self._make_receipt(parent_inode, component, parent.repo, parent.branch, sha)
+        elif parent.kind == "merge_trigger":
+            self._require_current_workspace(parent)
+            try:
+                source = decode_branch(component)
+            except ValueError:
+                raise pyfuse3.FUSEError(errno.EINVAL)
+            if not validate_branch(source) or source == parent.branch:
+                raise pyfuse3.FUSEError(errno.EINVAL)
+            branch_ctx = await self._branch_context(parent)
+            async with branch_ctx.lock:
+                sha = await self._merge(parent, source)
+                inode = self._make_receipt(parent_inode, component,
+                                           parent.repo, parent.branch, sha)
         else:
             raise pyfuse3.FUSEError(errno.EROFS)
         return self._attrs(self._node(inode))
